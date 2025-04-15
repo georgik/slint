@@ -198,8 +198,9 @@ impl slint::platform::Platform for EspBackend {
         // Prepare a draw buffer for the Slint software renderer.
         let mut buffer_provider = DrawBuffer {
             display,
-            buffer: &mut [slint::platform::software_renderer::Rgb565Pixel(0); 320],
+            buffer: &mut [RawU16Wrapper::default(); 320],
         };
+
 
         // Variable to track the last touch position.
         let mut last_touch = None;
@@ -254,7 +255,13 @@ impl slint::platform::Platform for EspBackend {
 
                 // Render the window if needed.
                 window.draw_if_needed(|renderer| {
+                    // let start = Instant::now().duration_since_epoch().as_micros();
+
                     renderer.render_by_line(&mut buffer_provider);
+
+                    // let end = Instant::now().duration_since_epoch().as_micros();
+                    // let transfer_duration = end - start;
+                    // info!("Render took {} µs", transfer_duration);
                 });
 
                 if window.has_active_animations() {
@@ -265,39 +272,88 @@ impl slint::platform::Platform for EspBackend {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+#[repr(transparent)]
+pub struct RawU16Wrapper(pub u16);
+
+impl slint::platform::software_renderer::TargetPixel for RawU16Wrapper {
+    fn blend(&mut self, color: slint::platform::software_renderer::PremultipliedRgbaColor) {
+        // Extract current pixel's 5/6-bit components
+        let r5 = (self.0 >> 11) & 0x1F;
+        let g6 = (self.0 >> 5) & 0x3F;
+        let b5 = self.0 & 0x1F;
+
+        // Approximate conversion to 8-bit components.
+        let bg_r = (r5 << 3) | (r5 >> 2);
+        let bg_g = (g6 << 2) | (g6 >> 4);
+        let bg_b = (b5 << 3) | (b5 >> 2);
+
+        // Use correct field names: `alpha`, `red`, `green`, `blue`
+        let inv_alpha = 255 - color.alpha as u16;
+
+        // Since `color` is premultiplied, its `red`, `green`, and `blue` are already scaled by alpha.
+        let new_r = ((color.red as u16) + (bg_r as u16 * inv_alpha) / 255) as u8;
+        let new_g = ((color.green as u16) + (bg_g as u16 * inv_alpha) / 255) as u8;
+        let new_b = ((color.blue as u16) + (bg_b as u16 * inv_alpha) / 255) as u8;
+
+        // Convert back to RGB565: reduce 8-bit to 5/6-bit.
+        let r5_new = new_r >> 3;
+        let g6_new = new_g >> 2;
+        let b5_new = new_b >> 3;
+
+        self.0 = ((r5_new as u16) << 11) | ((g6_new as u16) << 5) | (b5_new as u16);
+    }
+
+    fn from_rgb(red: u8, green: u8, blue: u8) -> Self {
+        let r5 = red >> 3;
+        let g6 = green >> 2;
+        let b5 = blue >> 3;
+        RawU16Wrapper(((r5 as u16) << 11) | ((g6 as u16) << 5) | (b5 as u16))
+    }
+}
+
+
 /// Provides a draw buffer for the MinimalSoftwareWindow renderer.
 struct DrawBuffer<'a, Display> {
     display: Display,
-    buffer: &'a mut [slint::platform::software_renderer::Rgb565Pixel],
+    buffer: &'a mut [RawU16Wrapper],
 }
 
+
 impl<
-        DI: mipidsi::interface::Interface<Word = u8>,
-        RST: OutputPin<Error = core::convert::Infallible>,
-    > slint::platform::software_renderer::LineBufferProvider
-    for &mut DrawBuffer<'_, mipidsi::Display<DI, mipidsi::models::ILI9486Rgb565, RST>>
+    DI: mipidsi::interface::Interface<Word = u8>,
+    RST: OutputPin<Error = core::convert::Infallible>,
+> slint::platform::software_renderer::LineBufferProvider
+for &mut DrawBuffer<'_, mipidsi::Display<DI, mipidsi::models::ILI9486Rgb565, RST>>
 {
-    type TargetPixel = slint::platform::software_renderer::Rgb565Pixel;
+    type TargetPixel = RawU16Wrapper;
 
     fn process_line(
         &mut self,
         line: usize,
         range: core::ops::Range<usize>,
-        render_fn: impl FnOnce(&mut [slint::platform::software_renderer::Rgb565Pixel]),
+        render_fn: impl FnOnce(&mut [RawU16Wrapper]),
     ) {
         let buffer = &mut self.buffer[range.clone()];
         render_fn(buffer);
 
-        // Update the display with the rendered line.
+        // Instead of mapping each pixel individually, reinterpret the slice.
+        // SAFETY: We know that RawU16Wrapper is #[repr(transparent)] over u16 and
+        // embedded_graphics_core::pixelcolor::Rgb565 is also a transparent wrapper around u16.
+        let pixels: &[embedded_graphics_core::pixelcolor::Rgb565] = unsafe {
+            core::slice::from_raw_parts(
+                buffer.as_ptr() as *const embedded_graphics_core::pixelcolor::Rgb565,
+                buffer.len(),
+            )
+        };
+
         self.display
             .set_pixels(
                 range.start as u16,
                 line as u16,
                 range.end as u16,
                 line as u16,
-                buffer
-                    .iter()
-                    .map(|x| embedded_graphics_core::pixelcolor::raw::RawU16::new(x.0).into()),
+                pixels.iter().cloned(),
             )
             .unwrap();
     }
