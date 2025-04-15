@@ -9,20 +9,14 @@ use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_alloc as _;
+use esp_alloc::HeapStats;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::DriveMode;
 use esp_hal::peripherals::Peripherals;
 use esp_hal::time::Instant;
-use esp_hal::{
-    delay::Delay,
-    gpio::{Level, Output, OutputConfig},
-    i2c::master::I2c,
-    // init,
-    spi::master::{Config as SpiConfig, Spi},
-    spi::Mode as SpiMode,
-    time::Rate,
-};
+use esp_hal::{delay::Delay, dma_buffers, gpio::{Level, Output, OutputConfig}, i2c::master::I2c, spi::master::{Config as SpiConfig, Spi}, spi::Mode as SpiMode, time::Rate};
+use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
 use esp_println::logger::init_logger_from_env;
 use gt911::Gt911Blocking;
 use log::{error, info, warn};
@@ -50,6 +44,9 @@ pub fn init() {
 
     // Initialize the PSRAM allocator.
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
+
+    let stats: HeapStats = esp_alloc::HEAP.stats();
+    info!("{}", stats);
 
     // Create an EspBackend that now owns the peripherals.
     slint::platform::set_platform(Box::new(EspBackend {
@@ -132,6 +129,11 @@ impl slint::platform::Platform for EspBackend {
         delay.delay_ms(50);
         // --- End GT911 I²C Address Selection Sequence ---
 
+        // --- DMA Buffers for SPI ---
+        let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) = dma_buffers!(1024);
+        let dma_rx_buf = DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();
+        let dma_tx_buf = DmaTxBuf::new(tx_descriptors, tx_buffer).unwrap();
+
         // --- Begin SPI and Display Initialization ---
         let spi = Spi::<esp_hal::Blocking>::new(
             peripherals.SPI2,
@@ -140,6 +142,8 @@ impl slint::platform::Platform for EspBackend {
         .unwrap()
         .with_sck(peripherals.GPIO7)
         .with_mosi(peripherals.GPIO6);
+        .with_dma(peripherals.DMA_CH0)
+        .with_buffers(dma_rx_buf, dma_tx_buf);
 
         // Display control pins.
         let dc = Output::new(peripherals.GPIO4, Level::Low, OutputConfig::default());
@@ -196,14 +200,19 @@ impl slint::platform::Platform for EspBackend {
         }
 
         // Prepare a draw buffer for the Slint software renderer.
+        let mut heap_buffer: Box<[slint::platform::software_renderer::Rgb565Pixel; 320]> =
+            Box::new([slint::platform::software_renderer::Rgb565Pixel(0); 320]);
+
         let mut buffer_provider = DrawBuffer {
             display,
-            buffer: &mut [slint::platform::software_renderer::Rgb565Pixel(0); 320],
+            buffer: heap_buffer.as_mut(),
         };
 
         // Variable to track the last touch position.
         let mut last_touch = None;
 
+        let stats: HeapStats = esp_alloc::HEAP.stats();
+        info!("{}", stats);
         // Main event loop.
         loop {
             slint::platform::update_timers_and_animations();
@@ -254,7 +263,11 @@ impl slint::platform::Platform for EspBackend {
 
                 // Render the window if needed.
                 window.draw_if_needed(|renderer| {
+                    // let start = Instant::now().duration_since_epoch().as_micros();
                     renderer.render_by_line(&mut buffer_provider);
+                    // let end = Instant::now().duration_since_epoch().as_micros();
+                    // let transfer_duration = end - start;
+                    // info!("Render took {} µs", transfer_duration);
                 });
 
                 if window.has_active_animations() {
