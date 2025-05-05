@@ -85,6 +85,21 @@ esp32-s3-box-3 = [
   "slint/libm",
   "gt911",
 ]
+esp32-s3-lcd-ev-board = [
+  "slint/unsafe-single-threaded",
+  "esp-hal/esp32s3",
+  "esp-hal/unstable",             # required for PSRAM support
+  "esp-hal/psram",
+  "embedded-hal",
+  "embedded-hal-bus",
+  "esp-alloc",
+  "esp-println/esp32s3",
+  "esp-backtrace/esp32s3",
+  "dep:mipidsi",
+  "embedded-graphics-core",
+  "slint/libm",
+  "gt911",
+]
 stm32u5g9j-dk2 = [
   "embassy-stm32/stm32u5g9zj",
   "embassy-stm32/time-driver-any",
@@ -151,7 +166,8 @@ embedded-display-controller = { version = "0.2.0", optional = true }
 ft5336 = { version = "0.2", optional = true }
 
 # Commented out until ported to newer version that matches embassy-time needed by stm32u5
-esp-hal = { version = "1.0.0-beta.0", optional = true }
+#esp-hal = { version = "1.0.0-beta.0", optional = true }
+esp-hal = { git = "https://github.com/esp-rs/esp-hal.git", rev = "611bdc6", features = ["esp32s3", "unstable"] }
 esp-alloc = { version = "0.7", optional = true }
 esp-println = { version = "0.13.1", features = ["log"], optional = true }
 esp-backtrace = { version = "0.15.1", optional = true, features = ["panic-handler", "println"] }

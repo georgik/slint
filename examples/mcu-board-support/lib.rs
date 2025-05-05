@@ -36,12 +36,22 @@ pub use esp32_s3_box_3::*;
 #[cfg(feature = "esp32-s3-box-3")]
 pub use esp_hal::main as entry;
 
+#[cfg(feature = "esp32-s3-lcd-ev-board")]
+mod esp32_s3_lcd_ev_board;
+#[cfg(feature = "esp32-s3-lcd-ev-board")]
+pub use esp32_s3_lcd_ev_board::*;
+#[cfg(feature = "esp32-s3-lcd-ev-board")]
+pub use esp_hal::main as entry;
+#[cfg(feature = "esp32-s3-lcd-ev-board")]
+pub use esp32_s3_lcd_ev_board::init_display as init;
+
 #[cfg(not(any(
     feature = "pico-st7789",
     feature = "pico2-st7789",
     feature = "stm32h735g",
     feature = "stm32u5g9j-dk2",
-    feature = "esp32-s3-box-3"
+    feature = "esp32-s3-box-3",
+    feature = "esp32-s3-lcd-ev-board"
 )))]
 pub use i_slint_core_macros::identity as entry;
 
@@ -50,7 +60,8 @@ pub use i_slint_core_macros::identity as entry;
     feature = "pico2-st7789",
     feature = "stm32h735g",
     feature = "stm32u5g9j-dk2",
-    feature = "esp32-s3-box-3"
+    feature = "esp32-s3-box-3",
+    feature = "esp32-s3-lcd-ev-board"
 )))]
 pub fn init() {}
 
@@ -59,5 +70,7 @@ mod embassy;
 
 pub mod prelude {
     #[cfg(feature = "esp32-s3-box-3")]
+    pub use esp_hal;
+    #[cfg(feature = "esp32-s3-lcd-ev-board")]
     pub use esp_hal;
 }
