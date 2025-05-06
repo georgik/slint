@@ -2,9 +2,34 @@
 //! Board support for ESP32-S3-LCD-EV-Board using the same init sequence as Conway's Game of Life example.
 
 extern crate alloc;
+
+// --- Slint platform integration imports ---
+use slint::platform;
+use slint::platform::software_renderer::MinimalSoftwareWindow;
+use slint::platform::software_renderer::RepaintBufferType;
+use slint::platform::software_renderer::Rgb565Pixel;
+use embedded_graphics_core::pixelcolor::Rgb565;
+use embedded_graphics_core::pixelcolor::raw::RawU16;
+use embedded_graphics_core::prelude::PixelColor;
+use core::time::Duration;
+use alloc::boxed::Box;
+use esp_hal::peripherals::Peripherals;
+use esp_hal::i2c;
+use esp_hal::rng::Rng;
+use embedded_graphics_framebuf::FrameBuf;
+use esp_hal::dma::{CHUNK_SIZE, DmaDescriptor, DmaTxBuf};
+use embedded_graphics_framebuf::backends::FrameBufferBackend;
+use embedded_graphics_core::pixelcolor::RgbColor;
+use embedded_graphics_core::pixelcolor::IntoStorage;
+
+use alloc::rc::Rc;
+use core::cell::RefCell;
+use embedded_graphics_core::geometry::OriginDimensions;
+use embedded_hal::delay::DelayNs;
+use embedded_hal::digital::OutputPin;
+use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::clock::CpuClock::_240MHz;
 use esp_hal::delay::Delay;
-use esp_hal::dma::{CHUNK_SIZE, DmaDescriptor};
 use esp_hal::i2c::master::{I2c, Config as I2cConfig, Error};
 use esp_hal::lcd_cam::{
     LcdCam,
@@ -17,11 +42,19 @@ use esp_hal::{
     Blocking,
     Config as HalConfig,
     gpio::{Level, Output, OutputConfig},
-    init,
+    // init,
     time::Rate,
 };
-use log::{info, error};
+use esp_hal::gpio::DriveMode;
+use esp_hal::spi::master::Spi;
+use esp_hal::time::Instant;
+use log::{info, error, warn};
 use esp_println::logger::init_logger_from_env;
+use gt911::Gt911Blocking;
+// use mipidsi::options::{ColorOrder, Orientation, Rotation};
+use i_slint_core::input::PointerEventButton;
+use i_slint_core::platform::WindowEvent;
+
 
 // === Display constants ===
 const LCD_H_RES: u16 = 480;
@@ -37,6 +70,312 @@ static mut TX_DESCRIPTORS: [DmaDescriptor; NUM_DMA_DESC] = [DmaDescriptor::EMPTY
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     error!("Panic: {}", _info);
     loop {}
+}
+
+
+/// A wrapper around a boxed array that implements FrameBufferBackend.
+pub struct HeapBuffer<C: PixelColor, const N: usize>(Box<[C; N]>);
+
+impl<C: PixelColor, const N: usize> HeapBuffer<C, N> {
+    pub fn new(data: Box<[C; N]>) -> Self {
+        Self(data)
+    }
+
+    pub fn as_slice(&self) -> &[C] {
+        self.0.as_ref()
+    }
+}
+
+impl<C: PixelColor, const N: usize> core::ops::Deref for HeapBuffer<C, N> {
+    type Target = [C; N];
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+impl<C: PixelColor, const N: usize> core::ops::DerefMut for HeapBuffer<C, N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.0
+    }
+}
+
+impl<C: PixelColor, const N: usize> FrameBufferBackend for HeapBuffer<C, N> {
+    type Color = C;
+    fn set(&mut self, index: usize, color: Self::Color) {
+        self.0[index] = color;
+    }
+    fn get(&self, index: usize) -> Self::Color {
+        self.0[index]
+    }
+    fn nr_elements(&self) -> usize {
+        N
+    }
+}
+
+struct EspBackend {
+    window: RefCell<Option<Rc<slint::platform::software_renderer::MinimalSoftwareWindow>>>,
+    peripherals: RefCell<Option<Peripherals>>,
+}
+
+impl Default for EspBackend {
+    fn default() -> Self {
+        EspBackend { window: RefCell::new(None), peripherals: RefCell::new(None) }
+    }
+}
+
+/// Initialize the heap and set the Slint platform.
+pub fn init() {
+    // Initialize peripherals first.
+    let peripherals = esp_hal::init(HalConfig::default().with_cpu_clock(_240MHz));
+    init_logger_from_env();
+    info!("Peripherals initialized");
+
+    // Initialize the PSRAM allocator.
+    esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
+
+    // Create and install the Slint backend that owns the peripherals.
+    slint::platform::set_platform(Box::new(EspBackend {
+        window: RefCell::new(None),
+        peripherals: RefCell::new(Some(peripherals)),
+    }))
+    .expect("Slint platform already initialized");
+}
+
+impl slint::platform::Platform for EspBackend {
+    fn create_window_adapter(
+        &self,
+    ) -> Result<Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError> {
+        let window = slint::platform::software_renderer::MinimalSoftwareWindow::new(
+            slint::platform::software_renderer::RepaintBufferType::ReusedBuffer,
+        );
+        self.window.replace(Some(window.clone()));
+        Ok(window)
+    }
+
+    fn duration_since_start(&self) -> core::time::Duration {
+        core::time::Duration::from_millis(Instant::now().duration_since_epoch().as_millis())
+    }
+
+    fn run_event_loop(&self) -> Result<(), slint::PlatformError> {
+        // Reinitialize peripherals, PSRAM, and logger
+        let peripherals = self.peripherals.borrow_mut().take().expect("Peripherals already taken");
+
+        // Setup I2C for the TCA9554 IO expander
+        let i2c = I2c::new(
+            peripherals.I2C0,
+            i2c::master::Config::default().with_frequency(Rate::from_khz(400)),
+        )
+        .unwrap()
+        .with_sda(peripherals.GPIO47)
+        .with_scl(peripherals.GPIO48);
+
+        // Initialize the IO expander for controlling the display
+        let mut expander = Tca9554::new(i2c);
+        expander.write_output_reg(0b1111_0011).unwrap();
+        expander.write_direction_reg(0b1111_0001).unwrap();
+
+        let delay = Delay::new();
+        info!("Initializing display...");
+
+        // Set up the write_byte function for sending commands to the display
+        let mut write_byte = |b: u8, is_cmd: bool| {
+            const SCS_BIT: u8 = 0b0000_0010;
+            const SCL_BIT: u8 = 0b0000_0100;
+            const SDA_BIT: u8 = 0b0000_1000;
+
+            let mut output = 0b1111_0001 & !SCS_BIT;
+            expander.write_output_reg(output).unwrap();
+
+            for bit in core::iter::once(!is_cmd).chain((0..8).map(|i| (b >> i) & 0b1 != 0).rev()) {
+                let prev = output;
+                if bit {
+                    output |= SDA_BIT;
+                } else {
+                    output &= !SDA_BIT;
+                }
+                if prev != output {
+                    expander.write_output_reg(output).unwrap();
+                }
+
+                output &= !SCL_BIT;
+                expander.write_output_reg(output).unwrap();
+
+                output |= SCL_BIT;
+                expander.write_output_reg(output).unwrap();
+            }
+
+            output &= !SCL_BIT;
+            expander.write_output_reg(output).unwrap();
+
+            output &= !SDA_BIT;
+            expander.write_output_reg(output).unwrap();
+
+            output |= SCS_BIT;
+            expander.write_output_reg(output).unwrap();
+        };
+
+        // VSYNC must be high during initialization
+        let mut vsync_pin = peripherals.GPIO3;
+        let vsync_guard = Output::new(vsync_pin.reborrow(), Level::High, OutputConfig::default());
+
+        // Initialize the display by sending the initialization commands
+        for &init in INIT_CMDS.iter() {
+            match init {
+                InitCmd::Cmd(cmd, args) => {
+                    write_byte(cmd, true);
+                    for &arg in args {
+                        write_byte(arg, false);
+                    }
+                }
+                InitCmd::Delay(ms) => {
+                    delay.delay_millis(ms as _);
+                }
+            }
+        }
+        drop(vsync_guard);
+
+        // Set up DMA channel for LCD
+        let tx_channel = peripherals.DMA_CH2;
+        let lcd_cam = LcdCam::new(peripherals.LCD_CAM);
+
+        // Configure the RGB display
+        let config = DpiConfig::default()
+            .with_clock_mode(ClockMode {
+                polarity: Polarity::IdleLow,
+                phase: Phase::ShiftLow,
+            })
+            .with_frequency(Rate::from_mhz(10))
+            .with_format(Format {
+                enable_2byte_mode: true,
+                ..Default::default()
+            })
+            .with_timing(FrameTiming {
+                horizontal_active_width: LCD_H_RES as usize,
+                vertical_active_height: LCD_V_RES as usize,
+                horizontal_total_width: 600,
+                horizontal_blank_front_porch: 80,
+                vertical_total_height: 600,
+                vertical_blank_front_porch: 80,
+                hsync_width: 10,
+                vsync_width: 4,
+                hsync_position: 10,
+            })
+            .with_vsync_idle_level(Level::High)
+            .with_hsync_idle_level(Level::High)
+            .with_de_idle_level(Level::Low)
+            .with_disable_black_region(false);
+
+        let mut dpi = Dpi::new(lcd_cam.lcd, tx_channel, config)
+            .unwrap()
+            .with_vsync(vsync_pin.reborrow())
+            .with_hsync(peripherals.GPIO46)
+            .with_de(peripherals.GPIO17)
+            .with_pclk(peripherals.GPIO9)
+            .with_data0(peripherals.GPIO10)
+            .with_data1(peripherals.GPIO11)
+            .with_data2(peripherals.GPIO12)
+            .with_data3(peripherals.GPIO13)
+            .with_data4(peripherals.GPIO14)
+            .with_data5(peripherals.GPIO21)
+            .with_data6(peripherals.GPIO8)
+            .with_data7(peripherals.GPIO18)
+            .with_data8(peripherals.GPIO45)
+            .with_data9(peripherals.GPIO38)
+            .with_data10(peripherals.GPIO39)
+            .with_data11(peripherals.GPIO40)
+            .with_data12(peripherals.GPIO41)
+            .with_data13(peripherals.GPIO42)
+            .with_data14(peripherals.GPIO2)
+            .with_data15(peripherals.GPIO1);
+
+        info!("Display initialized, starting logic");
+
+        // Initialize Game of Life state
+        const GRID_WIDTH: usize = 64;
+        const GRID_HEIGHT: usize = 64;
+        const LCD_BUFFER_SIZE: usize = (LCD_H_RES as usize) * (LCD_V_RES as usize);
+        const BUFFER_SIZE: usize = LCD_BUFFER_SIZE;
+        let mut game_grid = [[0u8; GRID_WIDTH]; GRID_HEIGHT];
+        let mut rng = Rng::new(peripherals.RNG);
+
+        // Allocate frame buffer and DMA buffer
+        let fb_data: Box<[Rgb565; LCD_BUFFER_SIZE]> = Box::new([Rgb565::BLACK; LCD_BUFFER_SIZE]);
+        let mut frame_buf = FrameBuf::new(HeapBuffer::new(fb_data), LCD_H_RES.into(), LCD_V_RES.into());
+        const FRAME_BYTES: usize = BUFFER_SIZE * 2;
+        let buf_box: Box<[u8; FRAME_BYTES]> = Box::new([0; FRAME_BYTES]);
+        let mut dma_tx: DmaTxBuf =
+            unsafe { DmaTxBuf::new(&mut TX_DESCRIPTORS, Box::leak(buf_box)).unwrap() };
+
+        // Main loop to draw and transfer
+        loop {
+            // Pack frame into DMA buffer
+            let dst = dma_tx.as_mut_slice();
+            for (i, px) in frame_buf.data.iter().enumerate() {
+                let [lo, hi] = px.into_storage().to_le_bytes();
+                dst[2 * i] = lo;
+                dst[2 * i + 1] = hi;
+            }
+
+            // One-shot transfer
+            match dpi.send(false, dma_tx) {
+                Ok(xfer) => {
+                    let (res, dpi2, buf2) = xfer.wait();
+                    dpi = dpi2;
+                    dma_tx = buf2;
+                    if let Err(e) = res {
+                        error!("DMA error: {:?}", e);
+                    }
+                }
+                Err((e, dpi2, buf2)) => {
+                    error!("DMA send error: {:?}", e);
+                    dpi = dpi2;
+                    dma_tx = buf2;
+                }
+            }
+        }
+        // We'll never reach here, but satisfy signature
+        // Ok(())
+    }
+}
+
+/// Provides a draw buffer for the MinimalSoftwareWindow renderer.
+struct DrawBuffer<'a, Display> {
+    display: Display,
+    buffer: &'a mut [slint::platform::software_renderer::Rgb565Pixel],
+}
+
+impl<
+        DI: mipidsi::interface::Interface<Word = u8>,
+        RST: OutputPin<Error = core::convert::Infallible>,
+    > slint::platform::software_renderer::LineBufferProvider
+    for &mut DrawBuffer<'_, mipidsi::Display<DI, mipidsi::models::ILI9486Rgb565, RST>>
+{
+    type TargetPixel = slint::platform::software_renderer::Rgb565Pixel;
+
+    fn process_line(
+        &mut self,
+        line: usize,
+        range: core::ops::Range<usize>,
+        render_fn: impl FnOnce(&mut [slint::platform::software_renderer::Rgb565Pixel]),
+    ) {
+        let buffer = &mut self.buffer[range.clone()];
+        render_fn(buffer);
+
+        // Update the display with the rendered line.
+        self.display
+            .set_pixels(
+                range.start as u16,
+                line as u16,
+                range.end as u16,
+                line as u16,
+                buffer
+                    .iter()
+                    .map(|x| {
+                        embedded_graphics_core::pixelcolor::raw::RawU16::new(x.0).into()
+                    }),
+            )
+            .unwrap();
+    }
 }
 
 // --- I2C expander (TCA9554) ---
@@ -202,126 +541,3 @@ const INIT_CMDS: &[InitCmd] = &[
     InitCmd::Delay(20),
 ];
 
-
-/// Initializes the display and expander; returns the configured DPI interface and the TX_DESCRIPTOR slice.
-pub fn init_display() -> (Dpi<'static, Blocking>, &'static mut [DmaDescriptor]) {
-    init_logger_from_env();
-
-    info!("Board init: starting ESP32-S3 LCD EV board setup");
-    // Initialize peripherals and PSRAM allocator
-    let mut peripherals = init(HalConfig::default().with_cpu_clock(_240MHz));
-    esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
-    info!("Peripherals initialized, PSRAM allocator set up");
-
-    // Setup I2C for expander
-    let i2c = I2c::new(
-        peripherals.I2C0,
-        I2cConfig::default().with_frequency(Rate::from_khz(400)),
-    )
-        .unwrap()
-        .with_sda(peripherals.GPIO47)
-        .with_scl(peripherals.GPIO48);
-    let mut expander = Tca9554::new(i2c);
-    expander.write_output_reg(0b1111_0011).unwrap();
-    expander.write_direction_reg(0b1111_0001).unwrap();
-    info!("I2C expander configured (power/backlight)");
-
-    let delay = Delay::new();
-
-    // Bitbang write_byte as in main.rs
-    let mut write_byte = |b: u8, is_cmd: bool| {
-        const SCS: u8 = 0b0000_0010;
-        const SCL: u8 = 0b0000_0100;
-        const SDA: u8 = 0b0000_1000;
-        let mut out = 0b1111_0001 & !SCS;
-        expander.write_output_reg(out).unwrap();
-        for bit in core::iter::once(!is_cmd).chain((0..8).map(|i| (b >> i) & 1 != 0).rev()) {
-            if bit { out |= SDA } else { out &= !SDA }
-            expander.write_output_reg(out).unwrap();
-            out &= !SCL;
-            expander.write_output_reg(out).unwrap();
-            out |= SCL;
-            expander.write_output_reg(out).unwrap();
-        }
-        out &= !SCL; expander.write_output_reg(out).unwrap();
-        out &= !SDA; expander.write_output_reg(out).unwrap();
-        out |= SCS; expander.write_output_reg(out).unwrap();
-    };
-
-    // Keep VSYNC high during init
-    let vsync_guard = Output::new(
-        peripherals.GPIO3.reborrow(),
-        Level::High,
-        OutputConfig::default(),
-    );
-
-    info!("Sending display controller init sequence");
-    // Run init sequence
-    for &cmd in INIT_CMDS {
-        info!("InitCmd: {:?}", cmd);
-        match cmd {
-            InitCmd::Cmd(code, args) => {
-                write_byte(code, true);
-                for &arg in args { write_byte(arg, false); }
-            }
-            InitCmd::Delay(ms) => delay.delay_millis(ms as _),
-        }
-    }
-    drop(vsync_guard);
-    info!("Display init sequence complete");
-
-    // Setup DMA descriptors
-    let tx_channel = peripherals.DMA_CH2;
-
-    // Init LcdCam and DPI configuration
-    let lcd_cam = LcdCam::new(peripherals.LCD_CAM);
-    let dpi_config = DpiConfig::default()
-        .with_clock_mode(ClockMode { polarity: Polarity::IdleLow, phase: Phase::ShiftLow })
-        .with_frequency(Rate::from_mhz(10))
-        .with_format(Format { enable_2byte_mode: true, ..Default::default() })
-        .with_timing(FrameTiming {
-            horizontal_active_width: LCD_H_RES as usize,
-            vertical_active_height: LCD_V_RES as usize,
-            horizontal_total_width: 600,
-            horizontal_blank_front_porch: 80,
-            vertical_total_height: 600,
-            vertical_blank_front_porch: 80,
-            hsync_width: 10,
-            vsync_width: 4,
-            hsync_position: 10,
-        })
-        .with_vsync_idle_level(Level::High)
-        .with_hsync_idle_level(Level::High)
-        .with_de_idle_level(Level::Low)
-        .with_disable_black_region(false);
-
-    // Build the DPI interface
-    let dpi = Dpi::new(lcd_cam.lcd, tx_channel, dpi_config)
-        .unwrap()
-        .with_vsync(peripherals.GPIO3)
-        .with_hsync(peripherals.GPIO46)
-        .with_de(peripherals.GPIO17)
-        .with_pclk(peripherals.GPIO9)
-        // Blue
-        .with_data0(peripherals.GPIO10)
-        .with_data1(peripherals.GPIO11)
-        .with_data2(peripherals.GPIO12)
-        .with_data3(peripherals.GPIO13)
-        .with_data4(peripherals.GPIO14)
-        // Green
-        .with_data5(peripherals.GPIO21)
-        .with_data6(peripherals.GPIO8)
-        .with_data7(peripherals.GPIO18)
-        .with_data8(peripherals.GPIO45)
-        .with_data9(peripherals.GPIO38)
-        .with_data10(peripherals.GPIO39)
-        // Red
-        .with_data11(peripherals.GPIO40)
-        .with_data12(peripherals.GPIO41)
-        .with_data13(peripherals.GPIO42)
-        .with_data14(peripherals.GPIO2)
-        .with_data15(peripherals.GPIO1);
-    info!("DPI interface initialized successfully");
-
-    (dpi, unsafe { &mut TX_DESCRIPTORS })
-}

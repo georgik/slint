@@ -42,8 +42,8 @@ mod esp32_s3_lcd_ev_board;
 pub use esp32_s3_lcd_ev_board::*;
 #[cfg(feature = "esp32-s3-lcd-ev-board")]
 pub use esp_hal::main as entry;
-#[cfg(feature = "esp32-s3-lcd-ev-board")]
-pub use esp32_s3_lcd_ev_board::init_display as init;
+// #[cfg(feature = "esp32-s3-lcd-ev-board")]
+// pub use esp32_s3_lcd_ev_board::init_display as init;
 
 #[cfg(not(any(
     feature = "pico-st7789",
