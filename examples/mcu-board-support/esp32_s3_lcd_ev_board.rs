@@ -42,23 +42,23 @@ where
     }
 }
 
-use embedded_graphics_core::pixelcolor::Rgb565;
-use slint::PhysicalPosition;
-use slint::LogicalPosition;
-use slint::PhysicalSize;
-use slint::platform::update_timers_and_animations;
-use embedded_graphics_core::pixelcolor::raw::RawU16;
-use embedded_graphics_core::prelude::PixelColor;
-use core::time::Duration;
 use alloc::boxed::Box;
-use esp_hal::peripherals::Peripherals;
-use esp_hal::i2c;
-use esp_hal::rng::Rng;
-use embedded_graphics_framebuf::FrameBuf;
-use esp_hal::dma::{CHUNK_SIZE, DmaDescriptor, DmaTxBuf};
-use embedded_graphics_framebuf::backends::FrameBufferBackend;
-use embedded_graphics_core::pixelcolor::RgbColor;
+use core::time::Duration;
+use embedded_graphics_core::pixelcolor::raw::RawU16;
 use embedded_graphics_core::pixelcolor::IntoStorage;
+use embedded_graphics_core::pixelcolor::Rgb565;
+use embedded_graphics_core::pixelcolor::RgbColor;
+use embedded_graphics_core::prelude::PixelColor;
+use embedded_graphics_framebuf::backends::FrameBufferBackend;
+use embedded_graphics_framebuf::FrameBuf;
+use esp_hal::dma::{DmaDescriptor, DmaTxBuf, CHUNK_SIZE};
+use esp_hal::i2c;
+use esp_hal::peripherals::Peripherals;
+use esp_hal::rng::Rng;
+use slint::platform::update_timers_and_animations;
+use slint::LogicalPosition;
+use slint::PhysicalPosition;
+use slint::PhysicalSize;
 
 use alloc::rc::Rc;
 use core::cell::RefCell;
@@ -68,31 +68,30 @@ use embedded_hal::digital::OutputPin;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::clock::CpuClock::_240MHz;
 use esp_hal::delay::Delay;
-use esp_hal::i2c::master::{I2c, Config as I2cConfig, Error};
+use esp_hal::gpio::DriveMode;
+use esp_hal::i2c::master::{Config as I2cConfig, Error, I2c};
 use esp_hal::lcd_cam::{
-    LcdCam,
     lcd::{
-        ClockMode, Phase, Polarity,
         dpi::{Config as DpiConfig, Dpi, Format, FrameTiming},
+        ClockMode, Phase, Polarity,
     },
+    LcdCam,
 };
+use esp_hal::spi::master::Spi;
+use esp_hal::time::Instant;
 use esp_hal::{
-    Blocking,
-    Config as HalConfig,
     gpio::{Level, Output, OutputConfig},
     // init,
     time::Rate,
+    Blocking,
+    Config as HalConfig,
 };
-use esp_hal::gpio::DriveMode;
-use esp_hal::spi::master::Spi;
-use esp_hal::time::Instant;
-use log::{info, error, warn};
 use esp_println::logger::init_logger_from_env;
+use log::{error, info, warn};
 // use mipidsi::options::{ColorOrder, Orientation, Rotation};
+use embedded_graphics_core::draw_target::DrawTarget;
 use i_slint_core::input::PointerEventButton;
 use i_slint_core::platform::WindowEvent;
-use embedded_graphics_core::draw_target::DrawTarget;
-
 
 // === Display constants ===
 const LCD_H_RES: u16 = 480;
@@ -109,7 +108,6 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     error!("Panic: {}", _info);
     loop {}
 }
-
 
 /// A wrapper around a boxed array that implements FrameBufferBackend.
 pub struct HeapBuffer<C: PixelColor, const N: usize>(Box<[C; N]>);
@@ -278,15 +276,9 @@ impl slint::platform::Platform for EspBackend {
 
         // Configure the RGB display
         let config = DpiConfig::default()
-            .with_clock_mode(ClockMode {
-                polarity: Polarity::IdleLow,
-                phase: Phase::ShiftLow,
-            })
+            .with_clock_mode(ClockMode { polarity: Polarity::IdleLow, phase: Phase::ShiftLow })
             .with_frequency(Rate::from_mhz(10))
-            .with_format(Format {
-                enable_2byte_mode: true,
-                ..Default::default()
-            })
+            .with_format(Format { enable_2byte_mode: true, ..Default::default() })
             .with_timing(FrameTiming {
                 horizontal_active_width: LCD_H_RES as usize,
                 vertical_active_height: LCD_V_RES as usize,
@@ -334,8 +326,10 @@ impl slint::platform::Platform for EspBackend {
         // Allocate a PSRAM-backed DMA buffer for the frame
         let buf_box: Box<[u8; FRAME_BYTES]> = Box::new([0; FRAME_BYTES]);
         let psram_buf: &'static mut [u8] = Box::leak(buf_box);
-        let mut dma_tx: DmaTxBuf = unsafe { DmaTxBuf::new(&mut TX_DESCRIPTORS, psram_buf).unwrap() };
-        let mut pixel_box: Box<[Rgb565Pixel; FRAME_PIXELS]> = Box::new([Rgb565Pixel(0); FRAME_PIXELS]);
+        let mut dma_tx: DmaTxBuf =
+            unsafe { DmaTxBuf::new(&mut TX_DESCRIPTORS, psram_buf).unwrap() };
+        let mut pixel_box: Box<[Rgb565Pixel; FRAME_PIXELS]> =
+            Box::new([Rgb565Pixel(0); FRAME_PIXELS]);
         let pixel_buf: &mut [Rgb565Pixel] = &mut *pixel_box;
         // Clear screen to blue for sanity check
         {
@@ -362,11 +356,7 @@ impl slint::platform::Platform for EspBackend {
 
         // Tell Slint the window dimensions match the DPI display resolution
         let size = PhysicalSize::new(LCD_H_RES.into(), LCD_V_RES.into());
-        self.window
-            .borrow()
-            .as_ref()
-            .expect("Window adapter not created")
-            .set_size(size);
+        self.window.borrow().as_ref().expect("Window adapter not created").set_size(size);
 
         // Initialize FT5x06 touch controller on I2C1 (example pins)
         // Reclaim the I2C bus from the expander for FT5x06
@@ -385,11 +375,12 @@ impl slint::platform::Platform for EspBackend {
             if let Some(window) = self.window.borrow().clone() {
                 // Poll FT5x06 touch each frame since INT line is NC
                 if let Ok(Some((x, y))) = touch.get_touch() {
-                    let pos = PhysicalPosition::new(x as i32, y as i32)
-                        .to_logical(window.scale_factor());
+                    let pos =
+                        PhysicalPosition::new(x as i32, y as i32).to_logical(window.scale_factor());
                     if let Some(prev) = last_touch.replace(pos) {
                         if prev != pos {
-                            window.try_dispatch_event(WindowEvent::PointerMoved { position: pos })?;
+                            window
+                                .try_dispatch_event(WindowEvent::PointerMoved { position: pos })?;
                         }
                     } else {
                         window.try_dispatch_event(WindowEvent::PointerPressed {
@@ -478,9 +469,7 @@ impl<
                 line as u16,
                 buffer
                     .iter()
-                    .map(|x| {
-                        embedded_graphics_core::pixelcolor::raw::RawU16::new(x.0).into()
-                    }),
+                    .map(|x| embedded_graphics_core::pixelcolor::raw::RawU16::new(x.0).into()),
             )
             .unwrap();
     }
@@ -578,9 +567,7 @@ const INIT_CMDS: &[InitCmd] = &[
     ),
     InitCmd::Cmd(
         0x68,
-        &[
-            0x00, 0x08, 0x15, 0x08, 0x15, 0x7a, 0x7a, 0x08, 0x15, 0x08, 0x15, 0x7a, 0x7a,
-        ],
+        &[0x00, 0x08, 0x15, 0x08, 0x15, 0x7a, 0x7a, 0x08, 0x15, 0x08, 0x15, 0x7a, 0x7a],
     ),
     InitCmd::Cmd(0x60, &[0x38, 0x08, 0x7a, 0x7a, 0x38, 0x09, 0x7a, 0x7a]),
     InitCmd::Cmd(0x63, &[0x31, 0xe4, 0x7a, 0x7a, 0x31, 0xe5, 0x7a, 0x7a]),
@@ -652,4 +639,3 @@ const INIT_CMDS: &[InitCmd] = &[
     InitCmd::Cmd(0x29, &[]),
     InitCmd::Delay(20),
 ];
-
