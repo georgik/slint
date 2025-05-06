@@ -10,6 +10,7 @@ use slint::platform::software_renderer::RepaintBufferType;
 use slint::platform::software_renderer::Rgb565Pixel;
 use embedded_graphics_core::pixelcolor::Rgb565;
 use slint::PhysicalPosition;
+use slint::PhysicalSize;
 use slint::platform::update_timers_and_animations;
 use embedded_graphics_core::pixelcolor::raw::RawU16;
 use embedded_graphics_core::prelude::PixelColor;
@@ -324,6 +325,14 @@ impl slint::platform::Platform for EspBackend {
                 dma_tx = tx2;
             }
         }
+
+        // Tell Slint the window dimensions match the DPI display resolution
+        let size = PhysicalSize::new(LCD_H_RES.into(), LCD_V_RES.into());
+        self.window
+            .borrow()
+            .as_ref()
+            .expect("Window adapter not created")
+            .set_size(size);
 
         loop {
             // 1) Let Slint update its timers and animations
