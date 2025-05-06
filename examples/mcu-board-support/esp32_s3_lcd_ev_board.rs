@@ -8,8 +8,43 @@ use slint::platform;
 use slint::platform::software_renderer::MinimalSoftwareWindow;
 use slint::platform::software_renderer::RepaintBufferType;
 use slint::platform::software_renderer::Rgb565Pixel;
+// --- FT5x06 Touch Controller ---
+struct Ft5x06<I2C> {
+    i2c: I2C,
+    address: u8,
+}
+
+impl<I2C> Ft5x06<I2C>
+where
+    I2C: embedded_hal::i2c::I2c,
+{
+    pub fn new(i2c: I2C, address: u8) -> Self {
+        Self { i2c, address }
+    }
+
+    /// Reads the first touch point. Returns Some((x, y)) if touched, None otherwise.
+    pub fn get_touch(&mut self) -> Result<Option<(u16, u16)>, I2C::Error> {
+        // 1) read touch count from register 0x02
+        let mut buf = [0u8; 1];
+        self.i2c.write_read(self.address, &[0x02], &mut buf)?;
+        let count = buf[0] & 0x0F;
+        if count == 0 {
+            return Ok(None);
+        }
+
+        // 2) read first touch coordinates from regs 0x03..0x06
+        let mut data = [0u8; 4];
+        self.i2c.write_read(self.address, &[0x03], &mut data)?;
+        let x = (((data[0] & 0x0F) as u16) << 8) | data[1] as u16;
+        let y = (((data[2] & 0x0F) as u16) << 8) | data[3] as u16;
+
+        Ok(Some((x, y)))
+    }
+}
+
 use embedded_graphics_core::pixelcolor::Rgb565;
 use slint::PhysicalPosition;
+use slint::LogicalPosition;
 use slint::PhysicalSize;
 use slint::platform::update_timers_and_animations;
 use embedded_graphics_core::pixelcolor::raw::RawU16;
@@ -53,7 +88,6 @@ use esp_hal::spi::master::Spi;
 use esp_hal::time::Instant;
 use log::{info, error, warn};
 use esp_println::logger::init_logger_from_env;
-use gt911::Gt911Blocking;
 // use mipidsi::options::{ColorOrder, Orientation, Rotation};
 use i_slint_core::input::PointerEventButton;
 use i_slint_core::platform::WindowEvent;
@@ -334,6 +368,12 @@ impl slint::platform::Platform for EspBackend {
             .expect("Window adapter not created")
             .set_size(size);
 
+        // Initialize FT5x06 touch controller on I2C1 (example pins)
+        // Reclaim the I2C bus from the expander for FT5x06
+        let mut i2c_bus = expander.into_i2c();
+        let mut touch = Ft5x06::new(i2c_bus, 0x38);
+        let mut last_touch: Option<LogicalPosition> = None;
+
         loop {
             // 1) Let Slint update its timers and animations
             slint::platform::update_timers_and_animations();
@@ -341,8 +381,30 @@ impl slint::platform::Platform for EspBackend {
             if let Some(window) = self.window.borrow().clone() {
                 window.request_redraw();
             }
-            
+
             if let Some(window) = self.window.borrow().clone() {
+                // Poll FT5x06 touch each frame since INT line is NC
+                if let Ok(Some((x, y))) = touch.get_touch() {
+                    let pos = PhysicalPosition::new(x as i32, y as i32)
+                        .to_logical(window.scale_factor());
+                    if let Some(prev) = last_touch.replace(pos) {
+                        if prev != pos {
+                            window.try_dispatch_event(WindowEvent::PointerMoved { position: pos })?;
+                        }
+                    } else {
+                        window.try_dispatch_event(WindowEvent::PointerPressed {
+                            position: pos,
+                            button: PointerEventButton::Left,
+                        })?;
+                    }
+                } else if let Some(pos) = last_touch.take() {
+                    window.try_dispatch_event(WindowEvent::PointerReleased {
+                        position: pos,
+                        button: PointerEventButton::Left,
+                    })?;
+                    window.try_dispatch_event(WindowEvent::PointerExited)?;
+                }
+
                 // 2) Render the UI into Slint's software renderer buffer
                 window.draw_if_needed(|renderer| {
                     let _dirty = renderer.render(pixel_buf, LCD_H_RES as usize);
@@ -439,6 +501,10 @@ impl Tca9554 {
     }
     pub fn write_output_reg(&mut self, value: u8) -> Result<(), Error> {
         self.i2c.write(self.address, &[0x01, value])
+    }
+
+    pub fn into_i2c(self) -> I2c<'static, Blocking> {
+        self.i2c
     }
 }
 
