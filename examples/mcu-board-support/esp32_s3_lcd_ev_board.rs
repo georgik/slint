@@ -9,6 +9,8 @@ use slint::platform::software_renderer::MinimalSoftwareWindow;
 use slint::platform::software_renderer::RepaintBufferType;
 use slint::platform::software_renderer::Rgb565Pixel;
 use embedded_graphics_core::pixelcolor::Rgb565;
+use slint::PhysicalPosition;
+use slint::platform::update_timers_and_animations;
 use embedded_graphics_core::pixelcolor::raw::RawU16;
 use embedded_graphics_core::prelude::PixelColor;
 use core::time::Duration;
@@ -54,6 +56,7 @@ use gt911::Gt911Blocking;
 // use mipidsi::options::{ColorOrder, Orientation, Rotation};
 use i_slint_core::input::PointerEventButton;
 use i_slint_core::platform::WindowEvent;
+use embedded_graphics_core::draw_target::DrawTarget;
 
 
 // === Display constants ===
@@ -288,53 +291,87 @@ impl slint::platform::Platform for EspBackend {
             .with_data14(peripherals.GPIO2)
             .with_data15(peripherals.GPIO1);
 
-        info!("Display initialized, starting logic");
+        info!("Display initialized, entering main loop...");
 
-        // Initialize Game of Life state
-        const GRID_WIDTH: usize = 64;
-        const GRID_HEIGHT: usize = 64;
-        const LCD_BUFFER_SIZE: usize = (LCD_H_RES as usize) * (LCD_V_RES as usize);
-        const BUFFER_SIZE: usize = LCD_BUFFER_SIZE;
-        let mut game_grid = [[0u8; GRID_WIDTH]; GRID_HEIGHT];
-        let mut rng = Rng::new(peripherals.RNG);
+        const FRAME_PIXELS: usize = (LCD_H_RES as usize) * (LCD_V_RES as usize);
+        const FRAME_BYTES: usize = FRAME_PIXELS * 2;
 
-        // Allocate frame buffer and DMA buffer
-        let fb_data: Box<[Rgb565; LCD_BUFFER_SIZE]> = Box::new([Rgb565::BLACK; LCD_BUFFER_SIZE]);
-        let mut frame_buf = FrameBuf::new(HeapBuffer::new(fb_data), LCD_H_RES.into(), LCD_V_RES.into());
-        const FRAME_BYTES: usize = BUFFER_SIZE * 2;
+        // Allocate a PSRAM-backed DMA buffer for the frame
         let buf_box: Box<[u8; FRAME_BYTES]> = Box::new([0; FRAME_BYTES]);
-        let mut dma_tx: DmaTxBuf =
-            unsafe { DmaTxBuf::new(&mut TX_DESCRIPTORS, Box::leak(buf_box)).unwrap() };
-
-        // Main loop to draw and transfer
-        loop {
-            // Pack frame into DMA buffer
+        let psram_buf: &'static mut [u8] = Box::leak(buf_box);
+        let mut dma_tx: DmaTxBuf = unsafe { DmaTxBuf::new(&mut TX_DESCRIPTORS, psram_buf).unwrap() };
+        let mut pixel_box: Box<[Rgb565Pixel; FRAME_PIXELS]> = Box::new([Rgb565Pixel(0); FRAME_PIXELS]);
+        let pixel_buf: &mut [Rgb565Pixel] = &mut *pixel_box;
+        // Clear screen to blue for sanity check
+        {
             let dst = dma_tx.as_mut_slice();
-            for (i, px) in frame_buf.data.iter().enumerate() {
-                let [lo, hi] = px.into_storage().to_le_bytes();
-                dst[2 * i] = lo;
-                dst[2 * i + 1] = hi;
+            let [blue_lo, blue_hi] = Rgb565::BLUE.into_storage().to_le_bytes();
+            for pixel in 0..FRAME_PIXELS {
+                dst[2 * pixel] = blue_lo;
+                dst[2 * pixel + 1] = blue_hi;
             }
+        }
+        // Initial flush of the blue screen
+        match dpi.send(false, dma_tx) {
+            Ok(xfer) => {
+                let (_res, dpi2, tx2) = xfer.wait();
+                dpi = dpi2;
+                dma_tx = tx2;
+            }
+            Err((e, dpi2, tx2)) => {
+                error!("Initial DMA send error: {:?}", e);
+                dpi = dpi2;
+                dma_tx = tx2;
+            }
+        }
 
-            // One-shot transfer
-            match dpi.send(false, dma_tx) {
-                Ok(xfer) => {
-                    let (res, dpi2, buf2) = xfer.wait();
-                    dpi = dpi2;
-                    dma_tx = buf2;
-                    if let Err(e) = res {
-                        error!("DMA error: {:?}", e);
+        loop {
+            // 1) Let Slint update its timers and animations
+            slint::platform::update_timers_and_animations();
+
+            if let Some(window) = self.window.borrow().clone() {
+                window.request_redraw();
+            }
+            
+            if let Some(window) = self.window.borrow().clone() {
+                // 2) Render the UI into Slint's software renderer buffer
+                window.draw_if_needed(|renderer| {
+                    let _dirty = renderer.render(pixel_buf, LCD_H_RES as usize);
+                });
+
+                // 3) Pack pixels into DMA buffer
+                {
+                    let dst = dma_tx.as_mut_slice();
+                    for (i, px) in pixel_buf.iter().enumerate() {
+                        let [lo, hi] = px.0.to_le_bytes();
+                        dst[2 * i] = lo;
+                        dst[2 * i + 1] = hi;
                     }
                 }
-                Err((e, dpi2, buf2)) => {
-                    error!("DMA send error: {:?}", e);
-                    dpi = dpi2;
-                    dma_tx = buf2;
+
+                // 3) One-shot DMA transfer of the full frame
+                match dpi.send(false, dma_tx) {
+                    Ok(xfer) => {
+                        let (res, dpi2, tx2) = xfer.wait();
+                        dpi = dpi2;
+                        dma_tx = tx2;
+                        if let Err(e) = res {
+                            error!("DMA error: {:?}", e);
+                        }
+                    }
+                    Err((e, dpi2, tx2)) => {
+                        error!("DMA send error: {:?}", e);
+                        dpi = dpi2;
+                        dma_tx = tx2;
+                    }
+                }
+
+                // 4) If there are active animations, continue immediately
+                if window.has_active_animations() {
+                    continue;
                 }
             }
         }
-        // We'll never reach here, but satisfy signature
-        // Ok(())
     }
 }
 
