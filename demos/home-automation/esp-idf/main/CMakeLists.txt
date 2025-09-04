@@ -6,10 +6,19 @@ idf_component_register(
     SRCS "main.cpp"
     INCLUDE_DIRS "."
     REQUIRES slint esp_lcd esp_driver_i2c esp_driver_gpio esp_driver_ledc esp_hw_support m5stack_tab5
-    PRIV_REQUIRES nvs_flash app_update esp_lcd_touch_gt911 esp_lcd_ili9881c
+    PRIV_REQUIRES nvs_flash app_update
 
 )
 
-slint_target_sources(${COMPONENT_LIB} ../../ui/demo-sw-renderer.slint COMPILATION_UNITS 20)
+# Use minimal UI without fonts for testing with BSP
+slint_target_sources(${COMPONENT_LIB} ../ui/minimal.slint)
 target_link_options(${COMPONENT_LIB} PUBLIC -Wl,--allow-multiple-definition)
-set_target_properties(${COMPONENT_LIB} PROPERTIES SLINT_EMBED_RESOURCES "embed-for-software-renderer-with-sdf")
+# Disable font embedding to avoid font-related crashes
+set_target_properties(${COMPONENT_LIB} PROPERTIES SLINT_EMBED_RESOURCES "embed-for-software-renderer")
+
+# Fix atomic operations stringop-overflow false positives in GCC 15.1.0
+target_compile_options(${COMPONENT_LIB} PRIVATE 
+    -Wno-stringop-overflow
+    -Wno-array-bounds
+    -fno-strict-aliasing
+)
