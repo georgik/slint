@@ -24,6 +24,7 @@ public:
     slint::platform::SoftwareRenderer m_renderer;
     bool needs_redraw = true;
     const slint::PhysicalSize m_size;
+    bool scale_factor_dispatched = false;
 
     explicit EspWindowAdapter(RepaintBufferType buffer_type, slint::PhysicalSize size)
         : m_renderer(buffer_type), m_size(size)
@@ -35,6 +36,16 @@ public:
     slint::PhysicalSize size() override { return m_size; }
 
     void request_redraw() override { needs_redraw = true; }
+
+    void set_visible(bool visible) override {
+        // Dispatch initial scale factor event when window becomes visible
+        // This is the correct time as per Slint documentation
+        if (visible && !scale_factor_dispatched) {
+            ESP_LOGI(TAG, "Window becoming visible, dispatching initial scale factor event: 1.0");
+            window().dispatch_scale_factor_change_event(1.0f);
+            scale_factor_dispatched = true;
+        }
+    }
 };
 
 template<typename PixelType>
@@ -89,6 +100,10 @@ std::unique_ptr<slint::platform::WindowAdapter> EspPlatform<PixelType>::create_w
     auto window = std::make_unique<EspWindowAdapter>(buffer_type, size);
     m_window = window.get();
     m_window->m_renderer.set_rendering_rotation(rotation);
+    
+    // Note: Scale factor event will be dispatched later in set_visible() when window becomes visible
+    ESP_LOGI(TAG, "Window adapter created, scale factor event will be dispatched when visible");
+    
     return window;
 }
 

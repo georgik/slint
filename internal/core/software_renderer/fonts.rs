@@ -190,9 +190,19 @@ pub fn text_size(
     scale_factor: ScaleFactor,
     text_wrap: TextWrap,
 ) -> LogicalSize {
+    // Check for invalid scale factor to prevent division by zero
+    if scale_factor.get() <= 0.0 {
+        crate::debug_log!("[SLINT ERROR] Invalid scale factor: {} - using default 1.0", scale_factor.get());
+        crate::debug_log!("[SLINT DEBUG] text_size called with text: '{}', font: {:?}", text, font_request.family);
+        return LogicalSize::new(0.0, 0.0);
+    }
+    
+    crate::debug_log!("[SLINT DEBUG] text_size: scale_factor={}, text='{}'", scale_factor.get(), text);
+    
     let font = match_font(&font_request, scale_factor);
     let (longest_line_width, height) = match font {
         Font::PixelFont(pf) => {
+            crate::debug_log!("[SLINT DEBUG] Using PixelFont for text rendering");
             let layout = text_layout_for_font(&pf, &font_request, scale_factor);
             layout.text_size(
                 text,
@@ -202,6 +212,7 @@ pub fn text_size(
         }
         #[cfg(feature = "software-renderer-systemfonts")]
         Font::VectorFont(vf) => {
+            crate::debug_log!("[SLINT DEBUG] Using VectorFont for text rendering");
             let layout = text_layout_for_font(&vf, &font_request, scale_factor);
             layout.text_size(
                 text,
@@ -211,7 +222,13 @@ pub fn text_size(
         }
     };
 
-    (PhysicalSize::from_lengths(longest_line_width, height).cast() / scale_factor).cast()
+    crate::debug_log!("[SLINT DEBUG] text_size before division: width={}, height={}, scale_factor={}", 
+              longest_line_width.get(), height.get(), scale_factor.get());
+    
+    // Perform safe division
+    let result = (PhysicalSize::from_lengths(longest_line_width, height).cast() / scale_factor).cast();
+    crate::debug_log!("[SLINT DEBUG] text_size result: width={}, height={}", result.width, result.height);
+    result
 }
 
 pub fn font_metrics(
