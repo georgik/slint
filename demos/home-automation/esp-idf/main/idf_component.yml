@@ -1,0 +1,8 @@
+# Copyright © SixtyFPS GmbH <info@slint.dev>
+# SPDX-License-Identifier: MIT
+
+## IDF Component Manager Manifest File
+dependencies:
+  idf: ">=5.4"
+  espressif/esp_lcd_ili9881c: "^1.0.1"
+  espressif/esp_lcd_touch_gt911: "^1.1.3"
